@@ -8,7 +8,6 @@
 typedef enum {
     EVENT_QUEUE_OK = 0,
     /*queue state error*/
-    EVENT_QUEUE_FULL,
     EVENT_QUEUE_CLOSED, 
 
     /*parameter*/
@@ -41,7 +40,8 @@ typedef struct {
 
     pthread_mutex_t mutex;
     pthread_cond_t cond;
-
+    pthread_cond_t not_empty_cond;
+    pthread_cond_t not_full_cond;
     bool closed;
 
 } event_queue_t;

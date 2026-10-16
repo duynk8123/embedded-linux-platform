@@ -23,11 +23,20 @@ event_queue_result_t event_queue_init(event_queue_t *queue){
         queue->closed = true;
         return EVENT_QUEUE_MUTEX_INIT_FAILED;
     }
-    result = pthread_cond_init(&queue->cond, NULL);
+    result = pthread_cond_init(&queue->not_full_cond, NULL);
 
     if(result != EVENT_QUEUE_OK){
         LOG_ERROR("[EVENT_QUEUE] Cannot create condition variable for event queue");
         pthread_mutex_destroy(&queue->mutex);
+        queue->closed = true;
+        return EVENT_QUEUE_COND_INIT_FAILED;
+    }
+    result = pthread_cond_init(&queue->not_empty_cond, NULL);
+
+    if(result != EVENT_QUEUE_OK){
+        LOG_ERROR("[EVENT_QUEUE] Cannot create condition variable for event queue");
+        pthread_mutex_destroy(&queue->mutex);
+        pthread_cond_destroy(&queue->not_full_cond);
         queue->closed = true;
         return EVENT_QUEUE_COND_INIT_FAILED;
     }
@@ -55,18 +64,28 @@ event_queue_result_t event_queue_push(event_queue_t *queue, const event_t *event
         LOG_ERROR("[EVENT_QUEUE] Queue event is closed");
     }
     else{
-        /*check queue full*/
-        if(queue->count == EVENT_QUEUE_CAPACITY){
-            result = EVENT_QUEUE_FULL;
-            LOG_INFO("[EVENT_QUEUE] Queue FULL");
+        /* wait until queue has emptied slot */
+        while(queue->count == EVENT_QUEUE_CAPACITY && queue->closed == false ){
+            LOG_INFO("[EVENT_QUEUE]  Queue FULL , waiting for popping ...");
+            result = pthread_cond_wait(&queue->not_full_cond,&queue->mutex);
+            if(result != EVENT_QUEUE_OK){
+                result = EVENT_QUEUE_COND_WAIT_FAILED;
+                pthread_mutex_unlock(&queue->mutex);
+                return result;
+            }
+            LOG_INFO("[EVENT_QUEUE]  Producer wakeup ...");
+        }
+        if(queue->closed){
+            result = EVENT_QUEUE_CLOSED;
+            LOG_INFO("[EVENT_QUEUE] Queue close");
         }
         else{
             queue->buffer[queue->tail] = *event;
             queue->tail = (queue->tail + 1) % EVENT_QUEUE_CAPACITY;
             queue->count++;
-            /*signal consumer get event*/
-            /*Note: push event Ok -> signal consumer fail -> should not retry*/
-            result = pthread_cond_signal(&queue->cond);
+            /* signal consumer get event */
+            /* Note: push event Ok -> signal consumer fail -> should not retry */
+            result = pthread_cond_signal(&queue->not_empty_cond);
             if(result != EVENT_QUEUE_OK){
                 LOG_ERROR("[EVENT_QUEUE] Signal to consumer fail");
                 result = EVENT_QUEUE_SIGNAL_FAILED;
@@ -97,7 +116,8 @@ event_queue_result_t event_queue_pop(event_queue_t *queue, event_t *event){
     }
     /*check queue open and empty*/
     while(queue->count == 0 && queue->closed == false){
-       result = pthread_cond_wait(&queue->cond,&queue->mutex);
+        LOG_INFO("[EVENT_QUEUE] Queue Empty, waiting for pushing ... ");
+       result = pthread_cond_wait(&queue->not_empty_cond,&queue->mutex);
        if(result != EVENT_QUEUE_OK){
             result = EVENT_QUEUE_COND_WAIT_FAILED;
             pthread_mutex_unlock(&queue->mutex);
@@ -112,7 +132,12 @@ event_queue_result_t event_queue_pop(event_queue_t *queue, event_t *event){
         *event = queue->buffer[queue->head];
         queue->head = (queue->head + 1) % EVENT_QUEUE_CAPACITY;
         queue->count--;
-        result = EVENT_QUEUE_OK;
+        /* signal producer */
+        result = pthread_cond_signal(&queue->not_full_cond);
+        if(result != EVENT_QUEUE_OK){
+            LOG_ERROR("[EVENT_QUEUE] Signal to producer push fail");
+            result = EVENT_QUEUE_SIGNAL_FAILED;
+        }
     }
     if(pthread_mutex_unlock(&queue->mutex) != EVENT_QUEUE_OK){
         LOG_ERROR("[EVENT_QUEUE] Unlock mutex failed");
@@ -130,19 +155,27 @@ event_queue_result_t event_queue_close(event_queue_t *queue){
         LOG_ERROR("[EVENT_QUEUE] Error param");
         return EVENT_QUEUE_INVALID_PARAM;
     }
-    if(queue->closed){
-        LOG_ERROR("[EVENT_QUEUE] Queue already closed");
-        return EVENT_QUEUE_CLOSED;
-    }
     result = pthread_mutex_lock(&queue->mutex);
     if(result != EVENT_QUEUE_OK){
         LOG_ERROR("[EVENT_QUEUE] Lock mutex failed");
         return EVENT_QUEUE_LOCK_MUTEX_FAILED;
     }
+
+    if(queue->closed){
+        LOG_ERROR("[EVENT_QUEUE] Queue already closed");
+        return EVENT_QUEUE_CLOSED;
+    }
+
     /*close queue*/
     queue->closed = true;
     /*notify all thread wake up*/
-    result = pthread_cond_broadcast(&queue->cond);
+    result = pthread_cond_broadcast(&queue->not_full_cond);
+    if(result != EVENT_QUEUE_OK){
+        LOG_ERROR("[EVENT_QUEUE] Notify all thread failed");
+        pthread_mutex_unlock(&queue->mutex);
+        return EVENT_QUEUE_COND_BROADCAST_FAILED;
+    }
+    result = pthread_cond_broadcast(&queue->not_empty_cond);
     if(result != EVENT_QUEUE_OK){
         LOG_ERROR("[EVENT_QUEUE] Notify all thread failed");
         pthread_mutex_unlock(&queue->mutex);
@@ -153,6 +186,9 @@ event_queue_result_t event_queue_close(event_queue_t *queue){
         return EVENT_QUEUE_UNLOCK_MUTEX_FAILED;
     }
 
+    if(result == EVENT_QUEUE_OK){
+        LOG_INFO("[EVENT_QUEUE] CLOSE QUEUE SUCCESS");
+    }
     return result;
 }
 /**
@@ -160,6 +196,8 @@ event_queue_result_t event_queue_close(event_queue_t *queue){
  */
 event_queue_result_t event_queue_deinit(event_queue_t *queue)
 {
+    event_queue_result_t result = EVENT_QUEUE_OK;
+
     if(queue == NULL){
         LOG_ERROR("[EVENT_QUEUE] Error param");
         return EVENT_QUEUE_INVALID_PARAM;
@@ -170,10 +208,17 @@ event_queue_result_t event_queue_deinit(event_queue_t *queue)
         return EVENT_QUEUE_MUTEX_DESTROY_FAILED;
     }
 
-    if(pthread_cond_destroy(&queue->cond) != 0){
+    if(pthread_cond_destroy(&queue->not_empty_cond) != 0){
+        LOG_ERROR("[EVENT_QUEUE] Destroy conditional variable failed");
+        return EVENT_QUEUE_COND_DESTROY_FAILED;
+    }
+    if(pthread_cond_destroy(&queue->not_full_cond) != 0){
         LOG_ERROR("[EVENT_QUEUE] Destroy conditional variable failed");
         return EVENT_QUEUE_COND_DESTROY_FAILED;
     }
 
-    return EVENT_QUEUE_OK;
+    if(result == EVENT_QUEUE_OK){
+        LOG_INFO("[EVENT_QUEUE] DEINIT QUEUE SUCCESS");
+    }
+    return result;
 }
